@@ -2,13 +2,23 @@ const { Ticket, Message, User } = require('../../database/models');
 
 const userStates = new Map();
 
+function extractMessageData(msg) {
+  if (msg.text) return { type: 'text', content: msg.text };
+  if (msg.photo) return { type: 'photo', content: msg.photo.at(-1).file_id };
+  if (msg.document) return { type: 'document', content: msg.document.file_id };
+  if (msg.video) return { type: 'video', content: msg.video.file_id };
+  if (msg.audio) return { type: 'audio', content: msg.audio.file_id };
+  return null;
+}
+
 async function showFeedbackMenu(bot, msgOrQuery) {
   const chatId = msgOrQuery.chat?.id || msgOrQuery.message?.chat?.id;
   const options = {
     reply_markup: {
       inline_keyboard: [
         [{ text: 'Отправить заявку', callback_data: 'send_new_ticket' }],
-        [{ text: 'Мои заявки', callback_data: 'my_tickets' }]
+        [{ text: 'Мои заявки', callback_data: 'my_tickets' }],
+        [{ text: 'Главное меню', callback_data: 'start' }]
       ]
     }
   };
@@ -42,22 +52,24 @@ async function handleMessage(bot, msg) {
     });
   }
 
-  if (state.action === 'waiting_for_ticket_text') {
-    // Чтобы избежать дублирования, проверяем, не было ли уже создано
-    // можно добавить временную метку в userStates и проверять ее
-    // либо отключить повторные вызовы этой функции во внешнем коде
+  const extracted = extractMessageData(msg);
+  if (!extracted) {
+    return bot.sendMessage(chatId, '❗ Поддерживаются только текст, фото, документы, аудио и видео.');
+  }
 
+  if (state.action === 'waiting_for_ticket_text') {
     const ticket = await Ticket.create({
       userId: user.id,
       status: 'open',
       createdAt: new Date(),
       updatedAt: new Date()
     });
-
     await Message.create({
       ticketId: ticket.id,
       userId: user.id,
-      text: msg.text,
+      text: extracted.type === 'text' ? extracted.content : null,
+      fileId: extracted.type !== 'text' ? extracted.content : null,
+      mediaType: extracted.type !== 'text' ? extracted.type : null,
       type: 'user'
     });
 
@@ -68,7 +80,7 @@ async function handleMessage(bot, msg) {
     });
 
     userStates.delete(chatId);
-    return;  // Добавил return, чтобы избежать двойной обработки
+    return;
   }
 
   if (state.action === 'user_replying' && state.ticketId) {
@@ -82,7 +94,9 @@ async function handleMessage(bot, msg) {
     await Message.create({
       ticketId: ticket.id,
       userId: user.id,
-      text: msg.text,
+      text: extracted.type === 'text' ? extracted.content : null,
+      fileId: extracted.type !== 'text' ? extracted.content : null,
+      mediaType: extracted.type !== 'text' ? extracted.type : null,
       type: 'user'
     });
 
@@ -92,9 +106,8 @@ async function handleMessage(bot, msg) {
     await bot.sendMessage(chatId, 'Ваше сообщение добавлено к заявке.');
     userStates.delete(chatId);
 
-    const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
-    if (ADMIN_CHAT_ID) {
-      await bot.sendMessage(ADMIN_CHAT_ID, `Новый ответ от пользователя в заявке #${ticket.id}`);
+    if (process.env.ADMIN_CHAT_ID) {
+      await bot.sendMessage(process.env.ADMIN_CHAT_ID, `📬 Новая заявка от ${user.name || user.telegramId} (#${ticket.id})`);
     }
     return;
   }
@@ -102,7 +115,7 @@ async function handleMessage(bot, msg) {
 
 async function listUserTickets(bot, msg) {
   const chatId = msg.chat.id;
-  const user = await User.findOne({ where: { telegramId: chatId.toString() } }); // исправил - telegramId это id пользователя из Telegram, а не chatId
+  const user = await User.findOne({ where: { telegramId: chatId.toString() } });
 
   if (!user) {
     await bot.sendMessage(chatId, 'Пользователь не найден.');
@@ -131,39 +144,56 @@ async function listUserTickets(bot, msg) {
 }
 
 async function showUserTicketDetails(bot, msg, ticketId) {
-  const chatId = msg.chat.id;
   const ticket = await Ticket.findByPk(ticketId, {
-    include: [{
-      model: Message,
-      include: [User],
-      order: [['createdAt', 'ASC']]
-    }]
+    include: [
+      {
+        model: Message,
+        order: [['createdAt', 'ASC']],
+      },
+      User,
+    ],
   });
 
   if (!ticket) {
-    await bot.sendMessage(chatId, 'Заявка не найдена.');
-    return;
+    return bot.sendMessage(msg.chat.id, 'Заявка не найдена.');
   }
 
-  let text = `📝 Заявка #${ticket.id}\n📌 Статус: ${ticket.status}\n\n`;
+  const messages = ticket.Messages.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  let hasAdminReply = false;
 
-  for (const m of ticket.Messages) {
-    const sender = m.userId === ticket.userId ? '👤 Пользователь' : '🛠 Админ';
-    text += `${sender}: ${m.text || m.content}\n`;
+  for (const m of messages) {
+    const sender = m.type === 'admin' ? '🛠️ Администратор' : '👤 Пользователь';
+    let caption = `${sender}:\n${m.text || ''}`;
+    if (m.type === 'admin') hasAdminReply = true;
+
+    if (m.fileId) {
+      switch (m.mediaType) {
+        case 'photo': await bot.sendPhoto(msg.chat.id, m.fileId, { caption }); break;
+        case 'document': await bot.sendDocument(msg.chat.id, m.fileId, { caption }); break;
+        case 'video': await bot.sendVideo(msg.chat.id, m.fileId, { caption }); break;
+        case 'audio': await bot.sendAudio(msg.chat.id, m.fileId, { caption }); break;
+        default: await bot.sendMessage(msg.chat.id, caption);
+      }
+    } else {
+      await bot.sendMessage(msg.chat.id, caption);
+    }
   }
 
-  const buttons = [];
-  if (ticket.status === 'open') {
-    buttons.push([{ text: '✍️ Проблема не решена', callback_data: `user_reply_ticket_${ticket.id}` }]);
-    buttons.push([{ text: '✅ Закрыть заявку', callback_data: `user_close_ticket_${ticket.id}` }]);
+  if (!hasAdminReply) {
+    await bot.sendMessage(msg.chat.id, '🛠️ Администратор: пока не ответил');
   }
 
-  buttons.push([{ text: '↩️ Назад', callback_data: 'my_tickets' }]);
-
-  await bot.sendMessage(chatId, text.slice(0, 4096), {
-    reply_markup: { inline_keyboard: buttons }
+  await bot.sendMessage(msg.chat.id, `📝 Заявка #${ticket.id}\n📌 Статус: ${ticket.status}`, {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '✍️ Проблема не решена', callback_data: `user_reply_ticket_${ticket.id}` }],
+        [{ text: 'Назад', callback_data: 'my_tickets' }],
+      ],
+    },
   });
 }
+
+
 
 async function promptUserReply(bot, msg, ticketId) {
   const chatId = msg.chat.id;
@@ -172,25 +202,6 @@ async function promptUserReply(bot, msg, ticketId) {
   await bot.sendMessage(chatId, 'Напишите сообщение для дополнения заявки. Для отмены нажмите "Отмена".', {
     reply_markup: {
       inline_keyboard: [[{ text: 'Отмена', callback_data: 'cancel' }]]
-    }
-  });
-}
-
-async function closeUserTicket(bot, msg, ticketId) {
-  const chatId = msg.chat.id;
-  const ticket = await Ticket.findByPk(ticketId);
-
-  if (!ticket) {
-    await bot.sendMessage(chatId, 'Заявка не найдена.');
-    return;
-  }
-
-  ticket.status = 'closed';
-  await ticket.save();
-
-  await bot.sendMessage(chatId, `Заявка #${ticket.id} закрыта.`, {
-    reply_markup: {
-      inline_keyboard: [[{ text: 'Назад', callback_data: 'my_tickets' }]]
     }
   });
 }
@@ -208,7 +219,6 @@ module.exports = {
   handleMessage,
   listUserTickets,
   showUserTicketDetails,
-  closeUserTicket,
   promptUserReply,
   cancelCurrentAction
 };

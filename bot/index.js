@@ -6,21 +6,16 @@ const adminHandler = require('./handlers/adminHandler');
 const faqHandler = require('./handlers/faqHandler');
 require('dotenv').config();
 
-
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
+bot.setMyCommands([
+  { command: 'start', description: 'Приветствие и начало работы' },
+  { command: 'menu', description: 'Главное меню бота' }
+]);
 
-require('./commands/faq')(bot);
-require('./commands/feedback')(bot);
-require('./commands/viewRequests')(bot);
-
-
-const apiApp = require('../server/api');
-apiApp.listen(process.env.PORT, () => {
-  console.log(`✅ Telegram бот и API работают на порту ${process.env.PORT}`);
-});
-
-
+require('./commands/start')(bot);
+const menuModule = require('./commands/menu');
+menuModule.init(bot);
 (async () => {
   try {
     await sequelize.sync({ alter: true });
@@ -30,31 +25,29 @@ apiApp.listen(process.env.PORT, () => {
   }
 })();
 
-
 bot.on('callback_query', async (query) => {
   const data = query.data;
+  console.log('callback_query.data:', data);
 
   try {
-    if (data.startsWith('faq')) {
-      const faqHandler = require('./handlers/faqHandler');
+    await bot.answerCallbackQuery(query.id);
+    if (data.startsWith('faq_search_answer_') || data.startsWith('faq_search_page_')) {
+      await faqHandler.handleCallbackSearchAnswer(bot, query);
+    } else if (data === 'start') {
+      await menuModule.showMainMenu(bot, query.message.chat.id, query.from.id);
+      return;
+    } else if (data === 'faq_menu') {
+      await faqHandler.handleFAQMenu(bot, query.message);
+    } else if (data.startsWith('faq')) {
       await faqHandler.handleCallback(bot, query);
+    } else if (data === 'admin_requests') {
+      await adminHandler.listAllTickets(bot, query);
     } else if (data.startsWith('admin_')) {
-      const adminHandler = require('./handlers/adminHandler');
       await adminHandler.handleAdminCallback(bot, query);
-    } else if (data.startsWith('admin_ticket_')) {
-      const adminHandler = require('./handlers/adminHandler');
-      const ticketId = data.split('_').pop();
-      await adminHandler.showTicketDetails(bot, query.message, ticketId);
-    } else if (data.startsWith('admin_close_ticket_')) {
-      const adminHandler = require('./handlers/adminHandler');
-      const ticketId = data.split('_').pop();
-      await adminHandler.closeTicket(bot, query.message, ticketId);
-    } else if (data.startsWith('admin_reply_ticket_')) {
-      const adminHandler = require('./handlers/adminHandler');
-      const ticketId = data.split('_').pop();
-      await adminHandler.promptReply(bot, query.message, ticketId);
     } else if (data === 'send_new_ticket') {
       await feedbackHandler.promptForNewTicket(bot, query.message);
+    } else if (data === 'feedback_menu') {
+      await feedbackHandler.showFeedbackMenu(bot, query.message);
     } else if (data === 'my_tickets') {
       await feedbackHandler.listUserTickets(bot, query.message);
     } else if (data.startsWith('user_ticket_')) {
@@ -63,27 +56,32 @@ bot.on('callback_query', async (query) => {
     } else if (data.startsWith('user_reply_ticket_')) {
       const ticketId = data.split('_').pop();
       await feedbackHandler.promptUserReply(bot, query.message, ticketId);
-    } else if (data.startsWith('user_close_ticket_')) {
-      const ticketId = data.split('_').pop();
-      await feedbackHandler.closeUserTicket(bot, query.message, ticketId);
     } else if (data === 'back_to_menu') {
       await feedbackHandler.showFeedbackMenu(bot, query.message);
     } else if (data === 'cancel') {
       await feedbackHandler.cancelCurrentAction(bot, query.message.chat.id);
-    } else if (data === 'start') {
-      require('./commands/start')(bot, query.message);
     }
-
-    await bot.answerCallbackQuery(query.id);
-
   } catch (err) {
     console.error('❌ Ошибка в callback_query:', err);
-    await bot.sendMessage(query.message.chat.id, 'Произошла ошибка при обработке запроса.');
+    if (query.message && query.message.chat) {
+      await bot.sendMessage(query.message.chat.id, 'Произошла ошибка при обработке запроса.');
+    }
   }
 });
 
-
 bot.on('message', async (msg) => {
+  const userId = msg.from.id;
+
+  const adminState = adminHandler?.adminStates?.get?.(userId);
+  if (adminState?.action === 'replying') {
+    return adminHandler.handleMessage(bot, msg);
+  }
+
+  const faqState = faqHandler.userStates?.get?.(userId);
+  if (faqState?.step === 'awaiting_keyword') {
+    return faqHandler.handleMessage(bot, msg);
+  }
+
   await feedbackHandler.handleMessage(bot, msg);
 });
 
